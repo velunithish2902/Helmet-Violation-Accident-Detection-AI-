@@ -1,0 +1,6 @@
+train: C:/Users/Administrator/nith/merged_dataset/train
+val: C:/Users/Administrator/nith/merged_dataset/valid
+test: C:/Users/Administrator/nith/merged_dataset/test
+
+nc: 2
+names: ['without helmet', 'accident']
