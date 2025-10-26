@@ -48,29 +48,24 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-
-# ✅ UPDATED: Telegram alert sends image file instead of just URL
+# ------------------ Helper Functions ------------------
 def send_telegram_alert(message, image_path=None):
-    """Send real-time alert with optional image to Telegram."""
+    """Send Telegram alert with optional image/video."""
     try:
-        # Send message text
-        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(telegram_api_url, data=data)
-
-        # Send image if provided
+        # Message
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                      data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+        # Image/Video
         if image_path and os.path.exists(image_path):
-            photo_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            with open(image_path, "rb") as photo:
-                files = {"photo": photo}
-                data = {"chat_id": TELEGRAM_CHAT_ID, "caption": "Detection Proof Image"}
-                requests.post(photo_api_url, data=data, files=files)
+            files = {"photo": open(image_path, "rb")} if image_path.endswith((".jpg", ".png")) else {"video": open(image_path, "rb")}
+            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto" if image_path.endswith((".jpg", ".png")) else f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": "Detection Proof"}
+            requests.post(api_url, data=data, files=files)
     except Exception as e:
         print(f"Telegram alert failed: {e}")
 
-
 def send_email(subject, body, recipients, attachment_path=None):
-    """Send email with optional PDF attachment."""
+    """Send email with optional attachment."""
     try:
         msg = MIMEMultipart()
         msg['From'] = SMTP_USER
@@ -96,8 +91,6 @@ def send_email(subject, body, recipients, attachment_path=None):
         print(f"Email send failed: {e}")
         return False
 
-
-# ------------------ PDF Report ------------------
 def create_pdf_report(data, query_text):
     """Generate PDF report summarizing detections."""
     pdf = FPDF()
@@ -139,7 +132,6 @@ def create_pdf_report(data, query_text):
     pdf.output(filename)
     return filename
 
-
 # ------------------ YOLO Model ------------------
 model = YOLO(os.getenv("YOLO_MODEL_PATH"))
 
@@ -156,7 +148,7 @@ with col1:
     camera = st.selectbox("Select Camera", ["Camera_1", "Camera_2"])
     uploaded_image = st.file_uploader("Choose an image...", type=["jpg", "png"], key="image_upload")
 
-    if uploaded_image and st.button("Run Detection"):
+    if uploaded_image and st.button("Run Image Detection"):
         with st.spinner("Processing image..."):
             try:
                 file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
@@ -215,7 +207,6 @@ with col1:
                     for pred in predictions:
                         pred["s3_link"] = s3_url
 
-                    # ✅ UPDATED: Telegram now sends image file, not just URL
                     if accident_detected:
                         message = (
                             f"🚨 Accident Detected!\n"
@@ -223,26 +214,115 @@ with col1:
                             f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                             f"🎯 Confidence: {confidence_value:.2f}"
                         )
-                        send_telegram_alert(message, local_filename)  # image sent directly
-
+                        send_telegram_alert(message, local_filename)
                         pdf_file = create_pdf_report(predictions, "Accident Detection")
-                        send_email(
-                            subject="Accident Alert",
-                            body=message,
-                            recipients=ALERT_EMAIL_TO,
-                            attachment_path=pdf_file
-                        )
+                        send_email(subject="Accident Alert", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
                         st.success("Accident alert sent via Telegram and Email!")
                 else:
                     st.info("✅ No 'no-helmet' or 'accident' detected.")
-            except Exception as e:
-                st.error(f"Error: {e}")
 
+            except Exception as e:
+                st.error(f"Image Processing Error: {e}")
+
+# ------------------ VIDEO DETECTION ------------------
+with col1:
+    st.markdown("### Upload Video for Detection")
+    uploaded_video = st.file_uploader("Choose a video...", type=["mp4", "avi"], key="video_upload")
+
+    if uploaded_video and st.button("Run Video Detection"):
+        with st.spinner("Processing video..."):
+            try:
+                video_bytes = uploaded_video.read()
+                video_path = f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+                with open(video_path, "wb") as f:
+                    f.write(video_bytes)
+
+                cap = cv2.VideoCapture(video_path)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                frame_idx = 0
+
+                video_output_path = f"detection_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = None
+
+                predictions = []
+                save_to_s3 = False
+                accident_detected = False
+                confidence_value = 0.0
+
+                progress_bar = st.progress(0)
+
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    results = model(frame)
+                    annotated_frame = results[0].plot()
+
+                    if out is None:
+                        h, w, _ = annotated_frame.shape
+                        out = cv2.VideoWriter(video_output_path, fourcc, 20, (w, h))
+                    out.write(annotated_frame)
+
+                    for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
+                        class_label = model.names[int(cls)]
+                        normalized_label = class_label.lower().replace(" ", "_")
+                        confidence = float(conf)
+                        bbox = [round(x, 2) for x in box.tolist()]
+
+                        predictions.append({
+                            "class_label": class_label,
+                            "confidence": confidence,
+                            "bbox": bbox,
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "camera_location": camera,
+                            "s3_link": ""
+                        })
+
+                        if normalized_label in ["no_helmet", "accident"]:
+                            save_to_s3 = True
+                            if normalized_label == "accident":
+                                accident_detected = True
+                                confidence_value = confidence
+
+                    frame_idx += 1
+                    progress_bar.progress(frame_idx / total_frames)
+
+                cap.release()
+                out.release()
+                st.video(video_output_path, format="video/mp4", start_time=0)
+                st.success("Video processing completed!")
+
+                if save_to_s3:
+                    s3_key = f"detections/{os.path.basename(video_output_path)}"
+                    s3_client.upload_file(video_output_path, S3_BUCKET, s3_key)
+                    s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
+                    st.success(f"Uploaded to S3: {s3_url}")
+
+                    for pred in predictions:
+                        pred["s3_link"] = s3_url
+
+                    if accident_detected:
+                        message = (
+                            f"🚨 Accident Detected in Video!\n"
+                            f"📍 Location: {camera}\n"
+                            f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"🎯 Confidence: {confidence_value:.2f}"
+                        )
+                        send_telegram_alert(message, video_output_path)
+                        pdf_file = create_pdf_report(predictions, "Accident Detection Video")
+                        send_email(subject="Accident Alert (Video)", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
+                        st.success("Accident alert sent via Telegram and Email!")
+                else:
+                    st.info("✅ No 'no-helmet' or 'accident' detected in video.")
+
+            except Exception as e:
+                st.error(f"Video Processing Error: {e}")
 
 # ------------------ POSTGRES QUERY ------------------
 with col2:
     st.markdown("### Query Last Detections")
-
     example_queries = [
         "Show me all accidents from last week.",
         "Which camera has the most helmet violations?",
@@ -288,12 +368,7 @@ with col2:
                     summary = f"Retrieved {len(data)} records."
                     if "email" in query.lower():
                         pdf_file = create_pdf_report(data, query)
-                        send_email(
-                            subject="Road Safety AI Report",
-                            body=f"Please find attached the PDF report for query: {query}",
-                            recipients=ALERT_EMAIL_TO,
-                            attachment_path=pdf_file
-                        )
+                        send_email(subject="Road Safety AI Report", body=f"Please find attached the PDF report for query: {query}", recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
                         summary += " PDF Report emailed to recipients."
                     return {"rows": data, "answer": summary}
 
