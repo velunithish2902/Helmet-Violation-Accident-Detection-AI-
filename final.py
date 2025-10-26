@@ -50,12 +50,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ------------------ Helper Functions ------------------
 def send_telegram_alert(message, image_path=None):
-    """Send Telegram alert with optional image/video."""
     try:
-        # Message
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                       data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
-        # Image/Video
         if image_path and os.path.exists(image_path):
             files = {"photo": open(image_path, "rb")} if image_path.endswith((".jpg", ".png")) else {"video": open(image_path, "rb")}
             api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto" if image_path.endswith((".jpg", ".png")) else f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
@@ -65,7 +62,6 @@ def send_telegram_alert(message, image_path=None):
         print(f"Telegram alert failed: {e}")
 
 def send_email(subject, body, recipients, attachment_path=None):
-    """Send email with optional attachment."""
     try:
         msg = MIMEMultipart()
         msg['From'] = SMTP_USER
@@ -92,7 +88,6 @@ def send_email(subject, body, recipients, attachment_path=None):
         return False
 
 def create_pdf_report(data, query_text):
-    """Generate PDF report summarizing detections."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
@@ -162,7 +157,6 @@ with col1:
                 cv2.imwrite(local_filename, annotated_img)
 
                 predictions = []
-                save_to_s3 = False
                 accident_detected = False
                 confidence_value = 0.0
 
@@ -188,43 +182,36 @@ with col1:
                     """, (datetime.now(), camera, class_label, confidence, bbox_str, ""))
                     conn.commit()
 
-                    if normalized_label in ["no_helmet", "accident"]:
-                        save_to_s3 = True
-                        if normalized_label == "accident":
-                            accident_detected = True
-                            confidence_value = confidence
+                    if normalized_label == "accident":
+                        accident_detected = True
+                        confidence_value = confidence
 
-                if predictions:
-                    st.markdown("### Detection Summary")
-                    st.dataframe(predictions)
+                st.markdown("### Detection Summary")
+                st.dataframe(predictions)
 
-                if save_to_s3:
-                    s3_key = f"detections/{local_filename}"
+                # Upload each detection to separate S3 folder
+                for pred in predictions:
+                    class_folder = "accident" if pred["class_label"].lower() == "accident" else "no_helmet"
+                    s3_key = f"detections/{class_folder}/{local_filename}"
                     s3_client.upload_file(local_filename, S3_BUCKET, s3_key)
                     s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
-                    st.success(f"Uploaded to S3: {s3_url}")
+                    pred["s3_link"] = s3_url
+                st.success("✅ Detections uploaded to S3!")
 
-                    for pred in predictions:
-                        pred["s3_link"] = s3_url
-
-                    if accident_detected:
-                        message = (
-                            f"🚨 Accident Detected!\n"
-                            f"📍 Location: {camera}\n"
-                            f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"🎯 Confidence: {confidence_value:.2f}"
-                        )
-                        send_telegram_alert(message, local_filename)
-                        pdf_file = create_pdf_report(predictions, "Accident Detection")
-                        send_email(subject="Accident Alert", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
-                        st.success("Accident alert sent via Telegram and Email!")
-                else:
-                    st.info("✅ No 'no-helmet' or 'accident' detected.")
+                if accident_detected:
+                    message = (
+                        f"🚨 Accident Detected!\n"
+                        f"📍 Location: {camera}\n"
+                        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"🎯 Confidence: {confidence_value:.2f}"
+                    )
+                    send_telegram_alert(message, local_filename)
+                    pdf_file = create_pdf_report(predictions, "Accident Detection")
+                    send_email(subject="Accident Alert", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
+                    st.success("Accident alert sent via Telegram and Email!")
 
             except Exception as e:
                 st.error(f"Image Processing Error: {e}")
-
-# ------------------ VIDEO DETECTION ------------------
 with col1:
     st.markdown("### Upload Video for Detection")
     uploaded_video = st.file_uploader("Choose a video...", type=["mp4", "avi"], key="video_upload")
