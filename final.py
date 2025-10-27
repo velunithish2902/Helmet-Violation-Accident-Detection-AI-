@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import boto3
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
 from ultralytics import YOLO
 from dotenv import load_dotenv
 import os
@@ -99,7 +99,7 @@ def create_pdf_report(data, query_text):
 
     total = len(data)
     accidents = sum(1 for d in data if d['class_label'].lower() == 'accident')
-    no_helmet = sum(1 for d in data if d['class_label'].lower() == 'no_helmet')
+    no_helmet = sum(1 for d in data if d['class_label'].lower() in ['no_helmet', 'without_helmet'])
 
     pdf.cell(0, 8, f"Total Detections: {total}", ln=True)
     pdf.cell(0, 8, f"Accidents: {accidents}", ln=True)
@@ -189,7 +189,7 @@ with col1:
                 st.markdown("### Detection Summary")
                 st.dataframe(predictions)
 
-                # Upload each detection to separate S3 folder
+                # Upload each detection to S3
                 for pred in predictions:
                     class_folder = "accident" if pred["class_label"].lower() == "accident" else "no_helmet"
                     s3_key = f"detections/{class_folder}/{local_filename}"
@@ -212,100 +212,114 @@ with col1:
 
             except Exception as e:
                 st.error(f"Image Processing Error: {e}")
-with col1:
+                 # ------------------ VIDEO DETECTION ------------------
+    st.markdown("---")
     st.markdown("### Upload Video for Detection")
     uploaded_video = st.file_uploader("Choose a video...", type=["mp4", "avi"], key="video_upload")
 
     if uploaded_video and st.button("Run Video Detection"):
-        with st.spinner("Processing video..."):
+        with st.spinner("Processing video... This may take a while ⏳"):
             try:
-                video_bytes = uploaded_video.read()
+                # Save uploaded video temporarily
                 video_path = f"uploaded_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
                 with open(video_path, "wb") as f:
-                    f.write(video_bytes)
+                    f.write(uploaded_video.read())
 
-                cap = cv2.VideoCapture(video_path)
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                frame_idx = 0
+                # Run YOLO inference on video
+                output_path = f"annotated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+                results = model.predict(source=video_path, save=True, project="runs/video_results", name="latest", stream=False)
 
-                video_output_path = f"detection_video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = None
+                # Get YOLO saved output (Ultralytics saves annotated video in runs/)
+                yolo_dir = "runs/video_results/latest"
+                for root, dirs, files in os.walk(yolo_dir):
+                    for file in files:
+                        if file.endswith((".mp4", ".avi")):
+                            output_path = os.path.join(root, file)
+                            break
 
-                predictions = []
-                save_to_s3 = False
+                st.video(output_path)
+
+                # Analyze frames for accident or helmet violations
+                cap = cv2.VideoCapture(output_path)
+                frame_count = 0
+                detections = []
                 accident_detected = False
-                confidence_value = 0.0
-
-                progress_bar = st.progress(0)
+                helmet_violation = False
 
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         break
+                    frame_count += 1
+                    if frame_count % 15 != 0:  # every 15th frame for efficiency
+                        continue
 
-                    results = model(frame)
-                    annotated_frame = results[0].plot()
+                    # Run YOLO detection frame-by-frame (optional, for live analysis)
+                    frame_results = model(frame)
+                    for r in frame_results:
+                        for box, cls, conf in zip(r.boxes.xyxy, r.boxes.cls, r.boxes.conf):
+                            class_label = model.names[int(cls)]
+                            normalized_label = class_label.lower().replace(" ", "_")
+                            confidence = float(conf)
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    if out is None:
-                        h, w, _ = annotated_frame.shape
-                        out = cv2.VideoWriter(video_output_path, fourcc, 20, (w, h))
-                    out.write(annotated_frame)
+                            detections.append({
+                                "timestamp": timestamp,
+                                "camera_location": camera,
+                                "class_label": class_label,
+                                "confidence": confidence
+                            })
 
-                    for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
-                        class_label = model.names[int(cls)]
-                        normalized_label = class_label.lower().replace(" ", "_")
-                        confidence = float(conf)
-                        bbox = [round(x, 2) for x in box.tolist()]
-
-                        predictions.append({
-                            "class_label": class_label,
-                            "confidence": confidence,
-                            "bbox": bbox,
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "camera_location": camera,
-                            "s3_link": ""
-                        })
-
-                        if normalized_label in ["no_helmet", "accident"]:
-                            save_to_s3 = True
+                            # Accident or no-helmet detection alerts
                             if normalized_label == "accident":
                                 accident_detected = True
-                                confidence_value = confidence
-
-                    frame_idx += 1
-                    progress_bar.progress(frame_idx / total_frames)
+                            elif normalized_label in ["no_helmet", "without_helmet"]:
+                                helmet_violation = True
 
                 cap.release()
-                out.release()
-                st.video(video_output_path, format="video/mp4", start_time=0)
-                st.success("Video processing completed!")
 
-                if save_to_s3:
-                    s3_key = f"detections/{os.path.basename(video_output_path)}"
-                    s3_client.upload_file(video_output_path, S3_BUCKET, s3_key)
-                    s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
-                    st.success(f"Uploaded to S3: {s3_url}")
+                # Upload annotated video to S3
+                s3_key = f"detections/videos/{os.path.basename(output_path)}"
+                s3_client.upload_file(output_path, S3_BUCKET, s3_key)
+                s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
 
-                    for pred in predictions:
-                        pred["s3_link"] = s3_url
+                # Log detections to PostgreSQL
+                for det in detections:
+                    cursor.execute("""
+                        INSERT INTO detections (timestamp, camera_location, class_label, confidence, s3_link)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (det["timestamp"], det["camera_location"], det["class_label"], det["confidence"], s3_url))
+                conn.commit()
 
-                    if accident_detected:
-                        message = (
-                            f"🚨 Accident Detected in Video!\n"
-                            f"📍 Location: {camera}\n"
-                            f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"🎯 Confidence: {confidence_value:.2f}"
-                        )
-                        send_telegram_alert(message, video_output_path)
-                        pdf_file = create_pdf_report(predictions, "Accident Detection Video")
-                        send_email(subject="Accident Alert (Video)", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
-                        st.success("Accident alert sent via Telegram and Email!")
-                else:
-                    st.info("✅ No 'no-helmet' or 'accident' detected in video.")
+                st.success("✅ Video processed and uploaded to S3!")
+                st.markdown(f"[View Annotated Video on S3 🔗]({s3_url})")
+
+                # Accident or helmet alert
+                if accident_detected:
+                    alert_msg = (
+                        f"🚨 Accident detected in video!\n"
+                        f"📍 Location: {camera}\n"
+                        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    send_telegram_alert(alert_msg, output_path)
+                    pdf_file = create_pdf_report(detections, "Accident Video Detection")
+                    send_email("Accident Video Alert", alert_msg, ALERT_EMAIL_TO, pdf_file)
+                    st.warning("🚨 Accident alert sent via Telegram and Email!")
+
+                elif helmet_violation:
+                    alert_msg = (
+                        f"⚠️ Helmet violation detected in video!\n"
+                        f"📍 Location: {camera}\n"
+                        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    send_telegram_alert(alert_msg, output_path)
+                    pdf_file = create_pdf_report(detections, "Helmet Violation Video Detection")
+                    send_email("Helmet Violation Alert", alert_msg, ALERT_EMAIL_TO, pdf_file)
+                    st.info("⚠️ Helmet violation alert sent via Telegram and Email!")
 
             except Exception as e:
                 st.error(f"Video Processing Error: {e}")
+
 
 # ------------------ POSTGRES QUERY ------------------
 with col2:
@@ -326,45 +340,100 @@ with col2:
             st.session_state['user_query_temp'] = q
             st.session_state['run_query'] = True
 
-    user_query = st.text_input("Or enter your query here:", value=st.session_state.get('user_query_temp', ''))
+    user_query = st.text_input(
+        "Or enter your query here:",
+        value=st.session_state.get('user_query_temp', '')
+    )
 
     if st.button("Run Query") or st.session_state['run_query']:
         if user_query:
             try:
                 def tool_postgres(query: str, default_limit: int = 10):
-                    m = re.search(r"last\s+(\d+)\s*(\w+)?", query.lower())
-                    limit = default_limit
-                    class_filter = None
-                    if m:
-                        limit = int(m.group(1))
-                        class_filter = m.group(2)
+                    q = query.lower().strip()
+                    sql_query = ""
+                    params = []
 
-                    sql_query = "SELECT id::text AS id, timestamp, camera_location, class_label, confidence, s3_link FROM detections"
-                    params = ()
-                    if class_filter and class_filter not in ["detections", "all"]:
-                        sql_query += " WHERE lower(class_label) = %s"
-                        params = (class_filter,)
+                    # CASE 1: Helmet violation count
+                    if "most helmet" in q or "helmet violations" in q or "count helmet" in q:
+                        sql_query = """
+                            SELECT camera_location, COUNT(*) AS helmet_violations
+                            FROM detections
+                            WHERE lower(class_label) IN (
+                                'no_helmet',
+                                'without_helmet',
+                                'helmet_violation',
+                                'helmet_violation_or_accident'
+                            )
+                            GROUP BY camera_location
+                            ORDER BY helmet_violations DESC
+                            LIMIT 1
+                        """
+                        cursor.execute(sql_query)
+                        row = cursor.fetchone()
+                        if row:
+                            data = [{"camera_location": row[0], "helmet_violations": row[1]}]
+                            answer = f"📸 Camera with most helmet violations: **{row[0]}** ({row[1]} violations)"
+                        else:
+                            data, answer = [], "No helmet violation data found."
+                        return {"rows": data, "answer": answer}
+
+                    # CASE 2: Time-based + filters
+                    where = []
+                    if "accident" in q:
+                        where.append("lower(class_label) = 'accident'")
+                    elif "helmet" in q:
+                        where.append("lower(class_label) IN ('no_helmet', 'without_helmet', 'helmet_violation', 'helmet_violation_or_accident')")
+
+                    if "today" in q:
+                        start = datetime.now().date()
+                        end = start + timedelta(days=1)
+                        where.append("timestamp BETWEEN %s AND %s")
+                        params += [start, end]
+                    elif "yesterday" in q:
+                        start = datetime.now().date() - timedelta(days=1)
+                        end = start + timedelta(days=1)
+                        where.append("timestamp BETWEEN %s AND %s")
+                        params += [start, end]
+                    elif "week" in q:
+                        start = datetime.now().date() - timedelta(days=7)
+                        where.append("timestamp >= %s")
+                        params.append(start)
+
+                    sql_query = """
+                        SELECT id::text AS id, timestamp, camera_location, class_label, confidence, s3_link
+                        FROM detections
+                    """
+                    if where:
+                        sql_query += " WHERE " + " AND ".join(where)
                     sql_query += " ORDER BY timestamp DESC LIMIT %s"
-                    params += (limit,)
+                    params.append(default_limit)
 
-                    cursor.execute(sql_query, params)
+                    cursor.execute(sql_query, tuple(params))
                     rows = cursor.fetchall()
                     cols = [desc[0] for desc in cursor.description]
-                    data = [{c: (v.isoformat() if hasattr(v, 'isoformat') else v) for c, v in zip(cols, row)} for row in rows]
+                    data = [dict(zip(cols, row)) for row in rows]
 
-                    summary = f"Retrieved {len(data)} records."
-                    if "email" in query.lower():
+                    answer = f"Retrieved {len(data)} detection records."
+                    if "email" in q:
                         pdf_file = create_pdf_report(data, query)
-                        send_email(subject="Road Safety AI Report", body=f"Please find attached the PDF report for query: {query}", recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
-                        summary += " PDF Report emailed to recipients."
-                    return {"rows": data, "answer": summary}
+                        send_email(
+                            subject="Road Safety AI Report",
+                            body=f"Attached is the report for your query: {query}",
+                            recipients=ALERT_EMAIL_TO,
+                            attachment_path=pdf_file
+                        )
+                        answer += " 📧 Report emailed successfully."
+
+                    return {"rows": data, "answer": answer}
 
                 resp = tool_postgres(user_query)
                 st.markdown("### Query Result")
                 st.write(resp["answer"])
                 if resp["rows"]:
                     st.dataframe(resp["rows"])
+
             except Exception as e:
                 st.error(f"Query Error: {e}")
 
         st.session_state['run_query'] = False
+   
