@@ -49,7 +49,17 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ------------------ Helper Functions ------------------
+# ------------------ S3 Upload Function ------------------
+def upload_to_s3(file_bytes, bucket_name, object_name):
+    try:
+        s3_client.put_object(Bucket=bucket_name, Key=object_name, Body=file_bytes)
+        file_url = f"https://{bucket_name}.s3.{os.getenv('AWS_REGION')}.amazonaws.com/{object_name}"
+        return file_url
+    except Exception as e:
+        print(f"S3 Upload failed: {e}")
+        return None
+
+# ------------------ Telegram Alert ------------------
 def send_telegram_alert(message, image_path=None):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -62,6 +72,7 @@ def send_telegram_alert(message, image_path=None):
     except Exception as e:
         print(f"Telegram alert failed: {e}")
 
+# ------------------ Email Sending ------------------
 def send_email(subject, body, recipients, attachment_path=None):
     try:
         msg = MIMEMultipart()
@@ -88,6 +99,7 @@ def send_email(subject, body, recipients, attachment_path=None):
         print(f"Email send failed: {e}")
         return False
 
+# ------------------ PDF Report Creation ------------------
 def create_pdf_report(data, query_text):
     pdf = FPDF()
     pdf.add_page()
@@ -98,6 +110,7 @@ def create_pdf_report(data, query_text):
     pdf.multi_cell(0, 8, f"Report generated for query: {query_text}")
     pdf.ln(5)
 
+    # Summary section
     total = len(data)
     accidents = sum(1 for d in data if d['class_label'].lower() == 'accident')
     no_helmet = sum(1 for d in data if d['class_label'].lower() in ['no_helmet', 'without_helmet'])
@@ -107,21 +120,34 @@ def create_pdf_report(data, query_text):
     pdf.cell(0, 8, f"Helmet Violations: {no_helmet}", ln=True)
     pdf.ln(5)
 
+    # Table header
     pdf.set_font("Arial", 'B', 12)
-    pdf.cell(30, 8, "Timestamp", 1)
-    pdf.cell(40, 8, "Camera", 1)
-    pdf.cell(40, 8, "Class", 1)
+    pdf.cell(25, 8, "Date", 1)
+    pdf.cell(22, 8, "Time", 1)
+    pdf.cell(35, 8, "Camera", 1)
+    pdf.cell(35, 8, "Class", 1)
     pdf.cell(20, 8, "Conf", 1)
     pdf.cell(60, 8, "S3 Link", 1)
     pdf.ln()
 
-    pdf.set_font("Arial", '', 12)
+    # Table rows
+    pdf.set_font("Arial", '', 11)
     for d in data:
-        pdf.cell(30, 8, str(d.get('timestamp', '')), 1)
-        pdf.cell(40, 8, str(d.get('camera_location', '')), 1)
-        pdf.cell(40, 8, str(d.get('class_label', '')), 1)
-        pdf.cell(20, 8, str(round(d.get('confidence', 0.0), 2)), 1)
-        pdf.cell(60, 8, str(d.get('s3_link', '-')), 1)
+        ts = str(d.get('timestamp', ''))
+        if ' ' in ts:
+            date_part, time_part = ts.split(' ', 1)
+        else:
+            date_part, time_part = ts, ''
+
+        pdf.cell(25, 8, date_part[:10], 1)
+        pdf.cell(22, 8, time_part[:8], 1)
+        pdf.cell(35, 8, str(d.get('camera_location', '')), 1)
+        pdf.cell(35, 8, str(d.get('class_label', '')), 1)
+        pdf.cell(20, 8, f"{float(d.get('confidence', 0.0)):.2f}", 1)
+        s3_link = str(d.get('s3_link', '-'))
+        if len(s3_link) > 40:
+            s3_link = s3_link[:37] + "..."
+        pdf.cell(60, 8, s3_link, 1)
         pdf.ln()
 
     filename = f"RoadSafety_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -137,8 +163,7 @@ st.markdown("<h1 style='text-align:center;'>🚦 Road Safety AI Dashboard</h1>",
 st.markdown("<p style='text-align:center; font-weight:bold;'>Drive Safe | Wear Helmet | Don’t Drink & Drive | Save Lives</p>", unsafe_allow_html=True)
 
 col1, col2 = st.columns(2)
-
-# ------------------ IMAGE DETECTION ------------------
+#-----------IMAGE TABLE-------
 with col1:
     st.markdown("### Upload Image for Detection")
     camera = st.selectbox("Select Camera", ["Camera_1", "Camera_2"])
@@ -147,16 +172,21 @@ with col1:
     if uploaded_image and st.button("Run Image Detection"):
         with st.spinner("Processing image..."):
             try:
+                # ---------------- Decode image ----------------
                 file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
                 img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+                # ---------------- YOLO detection ----------------
                 results = model(img)
                 annotated_img = results[0].plot()
                 st.image(annotated_img, channels="BGR", caption="Detection Result")
 
+                # ---------------- Save locally ----------------
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 local_filename = f"detection_{timestamp}.jpg"
                 cv2.imwrite(local_filename, annotated_img)
 
+                # ---------------- Parse detections ----------------
                 predictions = []
                 accident_detected = False
                 confidence_value = 0.0
@@ -173,46 +203,72 @@ with col1:
                         "bbox": bbox,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "camera_location": camera,
-                        "s3_link": ""
+                        "s3_link": "-"
                     })
 
                     bbox_str = '{' + ','.join(map(str, bbox)) + '}'
                     cursor.execute("""
                         INSERT INTO detections (timestamp, camera_location, class_label, confidence, bbox_coordinates, s3_link)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (datetime.now(), camera, class_label, confidence, bbox_str, ""))
+                    """, (datetime.now(), camera, class_label, confidence, bbox_str, "-"))
                     conn.commit()
 
                     if normalized_label == "accident":
                         accident_detected = True
                         confidence_value = confidence
 
+                # ---------------- Show results ----------------
                 st.markdown("### Detection Summary")
                 st.dataframe(predictions)
 
-                # Upload each detection to S3
-                for pred in predictions:
-                    class_folder = "accident" if pred["class_label"].lower() == "accident" else "no_helmet"
-                    s3_key = f"detections/{class_folder}/{local_filename}"
-                    s3_client.upload_file(local_filename, S3_BUCKET, s3_key)
-                    s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
-                    pred["s3_link"] = s3_url
-                st.success("✅ Detections uploaded to S3!")
+                # ---------------- Upload annotated image to S3 ----------------
+                s3_key = f"detections/{camera}/{local_filename}"
+                s3_url = upload_to_s3(open(local_filename, "rb").read(), S3_BUCKET, s3_key)
 
+                if s3_url:
+                    st.success(f"✅ Uploaded to S3: {s3_url}")
+                    # Update DB with S3 link
+                    cursor.execute("UPDATE detections SET s3_link = %s WHERE timestamp >= NOW() - INTERVAL '1 minute'", (s3_url,))
+                    conn.commit()
+                    for pred in predictions:
+                        pred["s3_link"] = s3_url
+                else:
+                    st.warning("⚠️ S3 upload failed, continuing without S3 link...")
+                    s3_url = "S3 upload failed"
+
+                # ---------------- PDF report ----------------
+                pdf_file = create_pdf_report(predictions, "Uploaded Image Detection")
+
+                # ---------------- Send alerts ----------------
                 if accident_detected:
                     message = (
                         f"🚨 Accident Detected!\n"
                         f"📍 Location: {camera}\n"
                         f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"🎯 Confidence: {confidence_value:.2f}"
+                        f"🎯 Confidence: {confidence_value:.2f}\n"
+                        f"🌐 S3 Link: {s3_url}"
                     )
                     send_telegram_alert(message, local_filename)
-                    pdf_file = create_pdf_report(predictions, "Accident Detection")
                     send_email(subject="Accident Alert", body=message, recipients=ALERT_EMAIL_TO, attachment_path=pdf_file)
-                    st.success("Accident alert sent via Telegram and Email!")
+                    st.success("🚨 Accident alert (with S3 link) sent via Telegram and Email!")
+                else:
+                    message = (
+                        f"✅ Detection Completed\n"
+                        f"📍 Location: {camera}\n"
+                        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"🌐 S3 Link: {s3_url}"
+                    )
+                    send_telegram_alert(message, local_filename)
+                    send_email("🚦 Road Safety Alert", message, ALERT_EMAIL_TO, pdf_file)
+                    st.info("📩 Detection completed — report sent via Email and Telegram (S3 link included).")
+
+                # ---------------- Download option ----------------
+                st.download_button("📄 Download Report PDF", open(pdf_file, "rb"), file_name=pdf_file)
 
             except Exception as e:
-                st.error(f"Image Processing Error: {e}")
+                st.error(f"⚠️ Image Processing Error: {e}")
+
+        
                  # ------------------ VIDEO DETECTION ------------------
   # ------------------ VIDEO DETECTION ------------------
 st.markdown("---")
